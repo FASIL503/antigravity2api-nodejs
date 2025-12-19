@@ -1,6 +1,9 @@
-import { getReasoningSignature, getToolSignature } from './thoughtSignatureCache.js';
-import { setToolNameMapping } from './toolNameCache.js';
-import { getThoughtSignatureForModel, getToolSignatureForModel } from './openai_signatures.js';
+// OpenAI 格式转换工具
+import config from '../../config/config.js';
+import { generateRequestId } from '../idGenerator.js';
+import { getReasoningSignature, getToolSignature } from '../thoughtSignatureCache.js';
+import { setToolNameMapping } from '../toolNameCache.js';
+import { getThoughtSignatureForModel, getToolSignatureForModel, sanitizeToolName, cleanParameters, modelMapping, isEnableThinking, generateGenerationConfig, extractSystemInstruction } from '../utils.js';
 
 function extractImagesFromContent(content) {
   const result = { text: '', images: [] };
@@ -16,12 +19,10 @@ function extractImagesFromContent(content) {
         const imageUrl = item.image_url?.url || '';
         const match = imageUrl.match(/^data:image\/(\w+);base64,(.+)$/);
         if (match) {
-          const format = match[1];
-          const base64Data = match[2];
           result.images.push({
             inlineData: {
-              mimeType: `image/${format}`,
-              data: base64Data
+              mimeType: `image/${match[1]}`,
+              data: match[2]
             }
           });
         }
@@ -34,26 +35,8 @@ function extractImagesFromContent(content) {
 function handleUserMessage(extracted, antigravityMessages) {
   antigravityMessages.push({
     role: 'user',
-    parts: [
-      { text: extracted.text },
-      ...extracted.images
-    ]
+    parts: [{ text: extracted.text }, ...extracted.images]
   });
-}
-
-function sanitizeToolName(name) {
-  if (!name || typeof name !== 'string') {
-    return 'tool';
-  }
-  let cleaned = name.replace(/[^a-zA-Z0-9_-]/g, '_');
-  cleaned = cleaned.replace(/^_+|_+$/g, '');
-  if (!cleaned) {
-    cleaned = 'tool';
-  }
-  if (cleaned.length > 128) {
-    cleaned = cleaned.slice(0, 128);
-  }
-  return cleaned;
 }
 
 function handleAssistantMessage(message, antigravityMessages, enableThinking, actualModelName, sessionId) {
@@ -65,26 +48,20 @@ function handleAssistantMessage(message, antigravityMessages, enableThinking, ac
     ? message.tool_calls.map(toolCall => {
         const originalName = toolCall.function.name;
         const safeName = sanitizeToolName(originalName);
-
         const part = {
           functionCall: {
             id: toolCall.id,
             name: safeName,
-            args: {
-              query: toolCall.function.arguments
-            }
+            args: { query: toolCall.function.arguments }
           }
         };
-
         if (sessionId && actualModelName && safeName !== originalName) {
           setToolNameMapping(sessionId, actualModelName, safeName, originalName);
         }
-
         if (enableThinking) {
           const cachedToolSig = getToolSignature(sessionId, actualModelName);
           part.thoughtSignature = toolCall.thoughtSignature || cachedToolSig || getToolSignatureForModel(actualModelName);
         }
-
         return part;
       })
     : [];
@@ -93,27 +70,16 @@ function handleAssistantMessage(message, antigravityMessages, enableThinking, ac
     lastMessage.parts.push(...antigravityTools);
   } else {
     const parts = [];
-
     if (enableThinking) {
       const cachedSig = getReasoningSignature(sessionId, actualModelName);
       const thoughtSignature = message.thoughtSignature || cachedSig || getThoughtSignatureForModel(actualModelName);
-      let reasoningText = '';
-      if (typeof message.reasoning_content === 'string' && message.reasoning_content.length > 0) {
-        reasoningText = message.reasoning_content;
-      } else {
-        reasoningText = ' ';
-      }
+      const reasoningText = (typeof message.reasoning_content === 'string' && message.reasoning_content.length > 0) ? message.reasoning_content : ' ';
       parts.push({ text: reasoningText, thought: true });
       parts.push({ text: ' ', thoughtSignature });
     }
-
     if (hasContent) parts.push({ text: message.content.trimEnd() });
     parts.push(...antigravityTools);
-
-    antigravityMessages.push({
-      role: 'model',
-      parts
-    });
+    antigravityMessages.push({ role: 'model', parts });
   }
 }
 
@@ -137,19 +103,14 @@ function handleToolCall(message, antigravityMessages) {
     functionResponse: {
       id: message.tool_call_id,
       name: functionName,
-      response: {
-        output: message.content
-      }
+      response: { output: message.content }
     }
   };
 
   if (lastMessage?.role === 'user' && lastMessage.parts.some(p => p.functionResponse)) {
     lastMessage.parts.push(functionResponse);
   } else {
-    antigravityMessages.push({
-      role: 'user',
-      parts: [functionResponse]
-    });
+    antigravityMessages.push({ role: 'user', parts: [functionResponse] });
   }
 }
 
@@ -168,11 +129,67 @@ function openaiMessageToAntigravity(openaiMessages, enableThinking, actualModelN
   return antigravityMessages;
 }
 
-export {
-  extractImagesFromContent,
-  handleUserMessage,
-  sanitizeToolName,
-  handleAssistantMessage,
-  handleToolCall,
-  openaiMessageToAntigravity
-};
+function convertOpenAIToolsToAntigravity(openaiTools, sessionId, actualModelName) {
+  if (!openaiTools || openaiTools.length === 0) return [];
+  return openaiTools.map((tool) => {
+    const rawParams = tool.function?.parameters || {};
+    const cleanedParams = cleanParameters(rawParams) || {};
+    if (cleanedParams.type === undefined) cleanedParams.type = 'object';
+    if (cleanedParams.type === 'object' && cleanedParams.properties === undefined) cleanedParams.properties = {};
+
+    const originalName = tool.function?.name;
+    const safeName = sanitizeToolName(originalName);
+    if (sessionId && actualModelName && safeName !== originalName) {
+      setToolNameMapping(sessionId, actualModelName, safeName, originalName);
+    }
+
+    return {
+      functionDeclarations: [{
+        name: safeName,
+        description: tool.function.description,
+        parameters: cleanedParams
+      }]
+    };
+  });
+}
+
+export function generateRequestBody(openaiMessages, modelName, parameters, openaiTools, token) {
+  const enableThinking = isEnableThinking(modelName);
+  const actualModelName = modelMapping(modelName);
+  const mergedSystemInstruction = extractSystemInstruction(openaiMessages);
+  let filteredMessages = openaiMessages;
+  let startIndex = 0;
+  if (config.useContextSystemPrompt) {
+    for (let i = 0; i < openaiMessages.length; i++) {
+      if (openaiMessages[i].role === 'system') {
+        startIndex = i + 1;
+      } else {
+        filteredMessages = openaiMessages.slice(startIndex);
+        break;
+      }
+    }
+  }
+
+  const requestBody = {
+    project: token.projectId,
+    requestId: generateRequestId(),
+    request: {
+      contents: openaiMessageToAntigravity(filteredMessages, enableThinking, actualModelName, token.sessionId),
+      tools: convertOpenAIToolsToAntigravity(openaiTools, token.sessionId, actualModelName),
+      toolConfig: { functionCallingConfig: { mode: 'VALIDATED' } },
+      generationConfig: generateGenerationConfig(parameters, enableThinking, actualModelName),
+      sessionId: token.sessionId
+    },
+    model: actualModelName,
+    userAgent: 'antigravity'
+  };
+
+  if (mergedSystemInstruction) {
+    requestBody.request.systemInstruction = {
+      role: 'user',
+      parts: [{ text: mergedSystemInstruction }]
+    };
+  }
+
+  return requestBody;
+}
