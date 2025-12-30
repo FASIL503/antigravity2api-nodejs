@@ -1,5 +1,5 @@
 # --- Stage 1: Dependency Builder ---
-FROM node:18-alpine AS builder
+FROM node:24-alpine
 
 WORKDIR /app
 
